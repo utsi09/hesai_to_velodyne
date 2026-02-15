@@ -1,202 +1,106 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
-#include <pcl_conversions/pcl_conversions.h>
-
-// Ring ID remapping tables (from original hesai_to_velodyne)
-static int RING_ID_MAP_RUBY[] = {
-    3, 66, 33, 96, 11, 74, 41, 104, 19, 82, 49, 112, 27, 90, 57, 120,
-    35, 98, 1, 64, 43, 106, 9, 72, 51, 114, 17, 80, 59, 122, 25, 88,
-    67, 34, 97, 0, 75, 42, 105, 8, 83, 50, 113, 16, 91, 58, 121, 24,
-    99, 2, 65, 32, 107, 10, 73, 40, 115, 18, 81, 48, 123, 26, 89, 56,
-    7, 70, 37, 100, 15, 78, 45, 108, 23, 86, 53, 116, 31, 94, 61, 124,
-    39, 102, 5, 68, 47, 110, 13, 76, 55, 118, 21, 84, 63, 126, 29, 92,
-    71, 38, 101, 4, 79, 46, 109, 12, 87, 54, 117, 20, 95, 62, 125, 28,
-    103, 6, 69, 36, 111, 14, 77, 44, 119, 22, 85, 52, 127, 30, 93, 60
-};
-
-static int RING_ID_MAP_16[] = {
-    0, 1, 2, 3, 4, 5, 6, 7, 15, 14, 13, 12, 11, 10, 9, 8
-};
-
-// Hesai point cloud format: XYZIRT with double timestamp
-struct HesaiPointXYZIRT {
-    PCL_ADD_POINT4D;
-    PCL_ADD_INTENSITY;
-    uint16_t ring = 0;
-    double timestamp = 0;
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-} EIGEN_ALIGN16;
-
-POINT_CLOUD_REGISTER_POINT_STRUCT(HesaiPointXYZIRT,
-    (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)
-    (uint16_t, ring, ring)(double, timestamp, timestamp))
-
-// Velodyne point cloud format: XYZIRT with float time (relative)
-struct VelodynePointXYZIRT {
-    PCL_ADD_POINT4D
-    PCL_ADD_INTENSITY;
-    uint16_t ring;
-    float time;
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-} EIGEN_ALIGN16;
-
-POINT_CLOUD_REGISTER_POINT_STRUCT(VelodynePointXYZIRT,
-    (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)
-    (uint16_t, ring, ring)(float, time, time))
-
-// Velodyne point cloud format: XYZIR (no time)
-struct VelodynePointXYZIR {
-    PCL_ADD_POINT4D
-    PCL_ADD_INTENSITY;
-    uint16_t ring;
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-} EIGEN_ALIGN16;
-
-POINT_CLOUD_REGISTER_POINT_STRUCT(VelodynePointXYZIR,
-    (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)
-    (uint16_t, ring, ring))
-
-template<typename T>
-bool has_nan(const T &point) {
-    return (std::isnan(point.x) || std::isnan(point.y) || std::isnan(point.z));
-}
+#include <cstring>
+#include <cmath>
 
 class HesaiToVelodyneNode : public rclcpp::Node
 {
 public:
     HesaiToVelodyneNode() : Node("hesai_to_velodyne")
     {
-        this->declare_parameter<std::string>("input_type", "XYZIRT");
-        this->declare_parameter<std::string>("output_type", "XYZIRT");
         this->declare_parameter<std::string>("input_topic", "/lidar_points");
         this->declare_parameter<std::string>("output_topic", "/velodyne_points");
         this->declare_parameter<std::string>("output_frame_id", "velodyne");
 
-        input_type_ = this->get_parameter("input_type").as_string();
-        output_type_ = this->get_parameter("output_type").as_string();
         std::string input_topic = this->get_parameter("input_topic").as_string();
         std::string output_topic = this->get_parameter("output_topic").as_string();
         output_frame_id_ = this->get_parameter("output_frame_id").as_string();
 
         pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(output_topic, rclcpp::SensorDataQoS());
-
-        if (input_type_ == "XYZI") {
-            sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-                input_topic, rclcpp::SensorDataQoS(),
-                std::bind(&HesaiToVelodyneNode::hesaiHandler_XYZI, this, std::placeholders::_1));
-        } else if (input_type_ == "XYZIRT") {
-            sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-                input_topic, rclcpp::SensorDataQoS(),
-                std::bind(&HesaiToVelodyneNode::hesaiHandler_XYZIRT, this, std::placeholders::_1));
-        } else {
-            RCLCPP_ERROR(this->get_logger(),
-                "Unsupported input type: '%s'. Use 'XYZI' or 'XYZIRT'.", input_type_.c_str());
-            rclcpp::shutdown();
-            return;
-        }
+        sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+            input_topic, rclcpp::SensorDataQoS(),
+            std::bind(&HesaiToVelodyneNode::callback, this, std::placeholders::_1));
 
         RCLCPP_INFO(this->get_logger(),
-            "hesai_to_velodyne started: %s [%s] -> %s [%s] (frame_id: %s)",
-            input_topic.c_str(), input_type_.c_str(),
-            output_topic.c_str(), output_type_.c_str(),
-            output_frame_id_.c_str());
+            "hesai_to_velodyne started: %s -> %s (frame_id: %s)",
+            input_topic.c_str(), output_topic.c_str(), output_frame_id_.c_str());
     }
 
 private:
-    template<typename T>
-    void publish_points(T &new_pc, const sensor_msgs::msg::PointCloud2 &old_msg) {
-        new_pc->is_dense = true;
-        sensor_msgs::msg::PointCloud2 pc_new_msg;
-        pcl::toROSMsg(*new_pc, pc_new_msg);
-        pc_new_msg.header = old_msg.header;
-        pc_new_msg.header.frame_id = output_frame_id_;
-        pub_->publish(pc_new_msg);
-    }
+    // Hesai PointCloud2 layout (point_step=26):
+    //   x(4) y(4) z(4) intensity(4) ring(2) timestamp(8)
+    //   offsets: 0    4    8    12          16       18
+    //
+    // Velodyne PointCloud2 layout (point_step=22):
+    //   x(4) y(4) z(4) intensity(4) ring(2) time(4)
+    //   offsets: 0    4    8    12          16      18
 
-    void hesaiHandler_XYZI(const sensor_msgs::msg::PointCloud2::SharedPtr pc_msg) {
-        pcl::PointCloud<pcl::PointXYZI>::Ptr pc(new pcl::PointCloud<pcl::PointXYZI>());
-        pcl::PointCloud<VelodynePointXYZIR>::Ptr pc_new(new pcl::PointCloud<VelodynePointXYZIR>());
-        pcl::fromROSMsg(*pc_msg, *pc);
+    static constexpr uint32_t HESAI_POINT_STEP = 26;
+    static constexpr uint32_t VELO_POINT_STEP = 22;
+    static constexpr uint32_t XYZ_IR_RING_SIZE = 18;  // x+y+z+intensity+ring bytes to copy directly
 
-        for (size_t point_id = 0; point_id < pc->points.size(); ++point_id) {
-            if (has_nan(pc->points[point_id]))
-                continue;
+    void callback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+    {
+        const uint32_t num_points = msg->width * msg->height;
+        if (num_points == 0) return;
 
-            VelodynePointXYZIR new_point;
-            new_point.x = pc->points[point_id].x;
-            new_point.y = pc->points[point_id].y;
-            new_point.z = pc->points[point_id].z;
-            new_point.intensity = pc->points[point_id].intensity;
-
-            if (pc->height == 16) {
-                new_point.ring = RING_ID_MAP_16[point_id / pc->width];
-            } else if (pc->height == 128) {
-                new_point.ring = RING_ID_MAP_RUBY[point_id % pc->height];
-            } else {
-                new_point.ring = 0;
-            }
-            pc_new->points.push_back(new_point);
+        // Verify input is Hesai XYZIRT format
+        if (msg->point_step != HESAI_POINT_STEP) {
+            RCLCPP_WARN_ONCE(this->get_logger(),
+                "Unexpected point_step %u (expected %u). Check input format.",
+                msg->point_step, HESAI_POINT_STEP);
+            return;
         }
 
-        publish_points(pc_new, *pc_msg);
-    }
+        // Get base timestamp from first point for relative time calculation
+        double base_timestamp;
+        std::memcpy(&base_timestamp, &msg->data[XYZ_IR_RING_SIZE], sizeof(double));
 
-    void hesaiHandler_XYZIRT(const sensor_msgs::msg::PointCloud2::SharedPtr pc_msg) {
-        pcl::PointCloud<HesaiPointXYZIRT>::Ptr pc_in(new pcl::PointCloud<HesaiPointXYZIRT>());
-        pcl::fromROSMsg(*pc_msg, *pc_in);
+        // Build output message
+        auto out = std::make_unique<sensor_msgs::msg::PointCloud2>();
+        out->header = msg->header;
+        out->header.frame_id = output_frame_id_;
+        out->height = 1;
+        out->width = num_points;
+        out->is_bigendian = false;
+        out->is_dense = msg->is_dense;
+        out->point_step = VELO_POINT_STEP;
+        out->row_step = num_points * VELO_POINT_STEP;
 
-        if (output_type_ == "XYZIRT") {
-            pcl::PointCloud<VelodynePointXYZIRT>::Ptr pc_out(new pcl::PointCloud<VelodynePointXYZIRT>());
-            for (size_t i = 0; i < pc_in->points.size(); ++i) {
-                if (has_nan(pc_in->points[i]))
-                    continue;
-                VelodynePointXYZIRT p;
-                p.x = pc_in->points[i].x;
-                p.y = pc_in->points[i].y;
-                p.z = pc_in->points[i].z;
-                p.intensity = pc_in->points[i].intensity;
-                p.ring = pc_in->points[i].ring;
-                p.time = static_cast<float>(pc_in->points[i].timestamp - pc_in->points[0].timestamp);
-                pc_out->points.push_back(p);
-            }
-            publish_points(pc_out, *pc_msg);
+        // Define output fields
+        out->fields.resize(6);
+        out->fields[0].name = "x";        out->fields[0].offset = 0;  out->fields[0].datatype = 7; out->fields[0].count = 1;
+        out->fields[1].name = "y";        out->fields[1].offset = 4;  out->fields[1].datatype = 7; out->fields[1].count = 1;
+        out->fields[2].name = "z";        out->fields[2].offset = 8;  out->fields[2].datatype = 7; out->fields[2].count = 1;
+        out->fields[3].name = "intensity"; out->fields[3].offset = 12; out->fields[3].datatype = 7; out->fields[3].count = 1;
+        out->fields[4].name = "ring";     out->fields[4].offset = 16; out->fields[4].datatype = 4; out->fields[4].count = 1;
+        out->fields[5].name = "time";     out->fields[5].offset = 18; out->fields[5].datatype = 7; out->fields[5].count = 1;
 
-        } else if (output_type_ == "XYZIR") {
-            pcl::PointCloud<VelodynePointXYZIR>::Ptr pc_out(new pcl::PointCloud<VelodynePointXYZIR>());
-            for (size_t i = 0; i < pc_in->points.size(); ++i) {
-                if (has_nan(pc_in->points[i]))
-                    continue;
-                VelodynePointXYZIR p;
-                p.x = pc_in->points[i].x;
-                p.y = pc_in->points[i].y;
-                p.z = pc_in->points[i].z;
-                p.intensity = pc_in->points[i].intensity;
-                p.ring = pc_in->points[i].ring;
-                pc_out->points.push_back(p);
-            }
-            publish_points(pc_out, *pc_msg);
+        // Allocate output buffer
+        out->data.resize(num_points * VELO_POINT_STEP);
 
-        } else if (output_type_ == "XYZI") {
-            pcl::PointCloud<pcl::PointXYZI>::Ptr pc_out(new pcl::PointCloud<pcl::PointXYZI>());
-            for (size_t i = 0; i < pc_in->points.size(); ++i) {
-                if (has_nan(pc_in->points[i]))
-                    continue;
-                pcl::PointXYZI p;
-                p.x = pc_in->points[i].x;
-                p.y = pc_in->points[i].y;
-                p.z = pc_in->points[i].z;
-                p.intensity = pc_in->points[i].intensity;
-                pc_out->points.push_back(p);
-            }
-            publish_points(pc_out, *pc_msg);
+        const uint8_t *src = msg->data.data();
+        uint8_t *dst = out->data.data();
+
+        for (uint32_t i = 0; i < num_points; ++i) {
+            // Copy x, y, z, intensity, ring (18 bytes) directly
+            std::memcpy(dst, src, XYZ_IR_RING_SIZE);
+
+            // Convert absolute timestamp (double) to relative time (float)
+            double ts;
+            std::memcpy(&ts, src + XYZ_IR_RING_SIZE, sizeof(double));
+            float rel_time = static_cast<float>(ts - base_timestamp);
+            std::memcpy(dst + XYZ_IR_RING_SIZE, &rel_time, sizeof(float));
+
+            src += HESAI_POINT_STEP;
+            dst += VELO_POINT_STEP;
         }
+
+        pub_->publish(std::move(out));
     }
 
-    std::string input_type_;
-    std::string output_type_;
     std::string output_frame_id_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_;
